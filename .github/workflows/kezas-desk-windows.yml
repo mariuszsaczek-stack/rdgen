@@ -1,0 +1,497 @@
+# KEZAS DESK - budowa wlasnego klienta Windows (fork rdgen, bez serwera rdgen).
+# Zrodlo: fork kodu ${{ github.repository_owner }}/rustdesk, galaz z commitami KEZAS DESK (np. kezas-desk-1.5.0).
+# Konfiguracja: katalog kezas/ w tym repozytorium (custom.json, ikony, logo). Wynik: artefakt "kezas-desk-windows".
+# Kroki budowania przepisane 1:1 z generator-windows.yml (rdgen); zmiany KEZAS DESK oznaczone komentarzem.
+name: KEZAS DESK Windows
+run-name: KEZAS DESK Windows ${{ inputs.version }} (${{ inputs.source_branch }})
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Wersja RustDesk (tag zrodla, np. 1.5.0)'
+        required: true
+        default: '1.5.0'
+        type: string
+      source_branch:
+        description: 'Galaz w forku rustdesk z commitami KEZAS DESK'
+        required: true
+        default: 'kezas-desk-1.5.0'
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  SCITER_RUST_VERSION: "1.75" # https://github.com/rustdesk/rustdesk/discussions/7503, also 1.78 has ABI change which causes our sciter version not working, https://blog.rust-lang.org/2024/03/30/i128-layout-update.html
+  RUST_VERSION: "1.75" # sciter failed on m1 with 1.78 because of https://blog.rust-lang.org/2024/03/30/i128-layout-update.html
+  CARGO_NDK_VERSION: "3.1.2"
+  SCITER_ARMV7_CMAKE_VERSION: "3.29.7"
+  SCITER_NASM_DEBVERSION: "2.15.05-1"
+  LLVM_VERSION: "15.0.6"
+  FLUTTER_VERSION: "3.24.5"
+  ANDROID_FLUTTER_VERSION: "3.24.5" 
+  # for arm64 linux because official Dart SDK does not work
+  FLUTTER_ELINUX_VERSION: "3.16.9"
+  TAG_NAME: "${{ inputs.upload-tag }}"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  # vcpkg version: 2024.07.12
+  VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
+  ARMV7_VCPKG_COMMIT_ID: "6f29f12e82a8293156836ad81cc9bf5af41fe836"
+  VERSION: "${{ inputs.version }}"
+  UPLOAD_ARTIFACT: 'true'
+  # KEZAS DESK: wartosci zamiast sekretow z serwera rdgen
+  appname: "KEZAS DESK"
+  filename: "kezas-desk"
+  compname: "Purslane Ltd"            # bez zmiany - nota prawna/copyright zostaje (AGPL)
+  urlLink: "https://rustdesk.com"     # bez zmiany
+  downloadLink: "https://rustdesk.com/download"  # bez zmiany
+
+jobs:
+  generate-bridge:
+    uses: ./.github/workflows/bridge.yml
+    with:
+      version: ${{ inputs.version }}
+
+  # KEZAS DESK: okno prywatnosci (TopMost) bez sekretow rdgen; commit jak w oficjalnym RustDesk 1.5.0
+  build-RustDeskTempTopMostWindow:
+    runs-on: windows-2022
+    env:
+      build_output_dir: RustDeskTempTopMostWindow/WindowInjection/x64/Release
+    steps:
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+      - name: Download and build
+        shell: pwsh
+        run: |
+          git clone https://github.com/rustdesk-org/RustDeskTempTopMostWindow RustDeskTempTopMostWindow
+          cd RustDeskTempTopMostWindow
+          git checkout ecd8d6a139eee76845ea66423fb739af450fda90
+          if ($LASTEXITCODE -ne 0) { throw "checkout failed" }
+          msbuild WindowInjection/WindowInjection.vcxproj -p:Configuration=Release -p:Platform=x64 /p:TargetVersion=Windows10
+      - name: Archive build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: topmostwindow-artifacts
+          path: ./${{ env.build_output_dir }}/WindowInjection.dll
+
+  build-for-windows-flutter:
+    name: Build Windows
+    needs: [build-RustDeskTempTopMostWindow, generate-bridge]
+    runs-on: ${{ matrix.job.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          - {
+              target: x86_64-pc-windows-msvc,
+              os: windows-2022,
+              arch: x86_64,
+              flutter-arch: x64,
+              vcpkg-triplet: x64-windows-static,
+              build-args: "--vram",
+            }
+    steps:
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      # KEZAS DESK: zrodlo z wlasnego forka (galaz z commitami KEZAS DESK) zamiast rustdesk/rustdesk
+      - name: Checkout source code (fork KEZAS DESK)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/rustdesk
+          ref: ${{ inputs.source_branch }}
+          submodules: recursive
+
+      # KEZAS DESK: konfiguracja i grafiki z tego repozytorium (katalog kezas/, poprawki .github/patches/)
+      - name: Checkout KEZAS DESK config
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: kezas-rdgen
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@v4
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Install ImageMagick on Windows
+        run: |
+          choco install -y imagemagick.app --no-progress
+          Get-ChildItem -Path "${env:ProgramFiles}" | % { $_.FullName } | Select-String -Pattern "[\/\\]ImageMagick[^\/\\]*$" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+
+      - name: fix flutter_gpu_texture_renderer (fixed in master rustdesk)
+        shell: bash
+        run: |
+          sed -i -e 's|2ded7f146437a761ffe6981e2f742038f85ca68d|08a471bb8ceccdd50483c81cdfa8b81b07b14b87|' ./flutter/pubspec.lock
+          sed -i -e 's|2ded7f146437a761ffe6981e2f742038f85ca68d|08a471bb8ceccdd50483c81cdfa8b81b07b14b87|' ./flutter/pubspec.yaml
+
+      - name: change appname to custom
+        if: env.appname != 'rustdesk'
+        continue-on-error: true
+        shell: bash
+        run: |
+          # ./Cargo.toml
+          sed -i -e 's|description = "RustDesk Remote Desktop"|description = "${{ env.appname }}"|' ./Cargo.toml
+          sed -i -e 's|ProductName = "RustDesk"|ProductName = "${{ env.appname }}"|' ./Cargo.toml
+          sed -i -e 's|FileDescription = "RustDesk Remote Desktop"|FileDescription = "${{ env.appname }}"|' ./Cargo.toml
+          sed -i -e 's|OriginalFilename = "rustdesk.exe"|OriginalFilename = "${{ env.appname }}.exe"|' ./Cargo.toml
+          # ./libs/portable/Cargo.toml
+          sed -i -e 's|description = "RustDesk Remote Desktop"|description = "${{ env.appname }}"|' ./libs/portable/Cargo.toml
+          sed -i -e 's|ProductName = "RustDesk"|ProductName = "${{ env.appname }}"|' ./libs/portable/Cargo.toml
+          sed -i -e 's|FileDescription = "RustDesk Remote Desktop"|FileDescription = "${{ env.appname }}"|' ./libs/portable/Cargo.toml
+          sed -i -e 's|OriginalFilename = "rustdesk.exe"|OriginalFilename = "${{ env.appname }}.exe"|' ./libs/portable/Cargo.toml
+          # ./libs/portable/src/main.rs
+          sed -i -e 's|const APP_PREFIX: \&str = "rustdesk";|const APP_PREFIX: \&str = "${{ env.appname }}";|' ./libs/portable/src/main.rs
+          # ./flutter/windows/runner/Runner.rc
+          sed -i -e 's|"RustDesk Remote Desktop"|"${{ env.appname }}"|' ./flutter/windows/runner/Runner.rc
+          sed -i -e 's|VALUE "InternalName", "rustdesk" "\0"|VALUE "InternalName", "${{ env.appname }}" "\0"|' ./flutter/windows/runner/Runner.rc
+          sed -i -e 's|"rustdesk.exe"|"${{ env.filename }}"|' ./flutter/windows/runner/Runner.rc
+          sed -i -e 's|"RustDesk"|"${{ env.appname }}"|' ./flutter/windows/runner/Runner.rc
+          # ./src/lang/*.rs
+          # KEZAS DESK: linia "powered_by_me" zostaje z "RustDesk" (nota licencyjna AGPL)
+          find ./src/lang -name "*.rs" -exec sed -i -e '/powered_by_me/!s|RustDesk|${{ env.appname }}|' {} \;
+          sed -i -e 's|RustDesk|${{ env.appname }}|' ./res/msi/Package/License.rtf
+
+
+      - name: fix registry if appname has a space
+        if: contains(env.appname, ' ')
+        continue-on-error: true
+        shell: bash
+        run: |
+          #./src/platform/windows.rs
+          sed -i -e 's|reg add {}|reg add \\\"{}\\\"|' ./src/platform/windows.rs
+          sed -i -e 's|reg add HKEY_CLASSES_ROOT\\\\.{ext} /f|reg add \\\"HKEY_CLASSES_ROOT\\\\.{ext}\\\" /f|' ./src/platform/windows.rs
+          sed -i -e 's|reg add HKEY_CLASSES_ROOT\\\\.{ext}\\\\DefaultIcon /f|reg add \\\"HKEY_CLASSES_ROOT\\\\.{ext}\\\\DefaultIcon\\\" /f|' ./src/platform/windows.rs
+          sed -i -e 's|reg add HKEY_CLASSES_ROOT\\\\.{ext}\\\\shell /f|reg add \\\"HKEY_CLASSES_ROOT\\\\.{ext}\\\\shell\\\" /f|' ./src/platform/windows.rs
+          sed -i -e 's|reg add HKEY_CLASSES_ROOT\\\\.{ext}\\\\shell\\\\open /f|reg add \\\"HKEY_CLASSES_ROOT\\\\.{ext}\\\\shell\\\\open\\\" /f|' ./src/platform/windows.rs
+          sed -i -e 's|reg add HKEY_CLASSES_ROOT\\\\.{ext}\\\\shell\\\\open\\\\command|reg add \\\"HKEY_CLASSES_ROOT\\\\.{ext}\\\\shell\\\\open\\\\command\\\"|' ./src/platform/windows.rs
+          sed -i -e 's|reg add HKEY_CLASSES_ROOT\\\\{ext} /f|reg add \\\"HKEY_CLASSES_ROOT\\\\{ext}\\\" /f|' ./src/platform/windows.rs
+          sed -i -e 's|reg add HKEY_CLASSES_ROOT\\\\{ext}\\\\shell /f|reg add \\\"HKEY_CLASSES_ROOT\\\\{ext}\\\\shell\\\" /f|' ./src/platform/windows.rs
+          sed -i -e 's|reg add HKEY_CLASSES_ROOT\\\\{ext}\\\\shell\\\\open /f|reg add \\\"HKEY_CLASSES_ROOT\\\\{ext}\\\\shell\\\\open\\\" /f|' ./src/platform/windows.rs
+          sed -i -e 's|reg add HKEY_CLASSES_ROOT\\\\{ext}\\\\shell\\\\open\\\\command /f|reg add \\\"HKEY_CLASSES_ROOT\\\\{ext}\\\\shell\\\\open\\\\command\\\" /f|' ./src/platform/windows.rs
+          sed -i -e 's|{subkey}|\\\"{subkey}\\\"|' ./src/platform/windows.rs
+          sed -i -e 's|reg delete HKEY_CLASSES_ROOT\\\\.{ext} /f|reg delete \\\"HKEY_CLASSES_ROOT\\\\.{ext}\\\" /f|' ./src/platform/windows.rs
+          sed -i -e 's|reg delete HKEY_CLASSES_ROOT\\\\{ext} /f|reg delete \\\"HKEY_CLASSES_ROOT\\\\{ext}\\\" /f|' ./src/platform/windows.rs
+
+      # KEZAS DESK: zmiany ponizej z lokalnych kopii poprawek (nie z internetu w trakcie budowy)
+      - name: allow custom.txt
+        shell: pwsh
+        run: |
+          python ./kezas-rdgen/.github/patches/allowCustom.py
+          if ($LASTEXITCODE -ne 0) { throw "allowCustom failed" }
+          git apply ./kezas-rdgen/.github/patches/removeSetupServerTip.diff
+          if ($LASTEXITCODE -ne 0) { throw "removeSetupServerTip failed" }
+          if (Select-String -Path ./src/common.rs -SimpleMatch '5Qbwsde3unUcJBtrx9ZkvUmwFNoExHzpryHuPUdqlWM=' -Quiet) { throw "custom config signature check still present" }
+
+      - name: Patch remote printer port to spool file
+        shell: python
+        run: |
+          import os, re
+
+          src = "."
+          app = os.environ.get("appname") or "RustDesk"
+          literal = "C:\\\\ProgramData\\\\%s\\\\printer-spool\\\\job.prn" % app
+
+          # atch Rust remote_printer lib.rs
+          rs = os.path.join(src, "libs", "remote_printer", "src", "lib.rs")
+          if os.path.isfile(rs):
+              with open(rs, "r", encoding="utf-8") as f:
+                  t = f.read()
+              if "printer-spool" in t:
+                  print("Rust printer port already points to spool file")
+              else:
+                  old = ('fn get_port_name(app_name: &str) -> Vec<u16> {\n'
+                         '    format!("{} Printer", app_name)')
+                  new = ('fn get_port_name(app_name: &str) -> Vec<u16> {\n'
+                         '    let base = std::env::var("ProgramData")\n'
+                         '        .unwrap_or_else(|_| "C:\\\\ProgramData".to_string());\n'
+                         '    let dir = format!("{}\\\\{}\\\\printer-spool", base, app_name);\n'
+                         '    let _ = std::fs::create_dir_all(&dir);\n'
+                         '    format!("{}\\\\job.prn", dir)')
+                  if old in t:
+                      with open(rs, "w", encoding="utf-8") as f:
+                          f.write(t.replace(old, new, 1))
+                      print("Successfully patched Rust printer port")
+                  else:
+                      print("Warning: get_port_name() signature not matched in Rust source")
+
+          # patch C++ MSI Custom Action
+          cpp = os.path.join(src, "res", "msi", "CustomActions", "RemotePrinter.cpp")
+          if os.path.isfile(cpp):
+              with open(cpp, "r", encoding="utf-8") as f:
+                  t = f.read()
+              if "printer-spool" in t:
+                  print("MSI printer port already points to spool file")
+              else:
+                  pattern = r'(RD_PRINTER_PORT\s*=\s*)L"[^"]*"'
+                  new_t, n = re.subn(pattern, lambda m: m.group(1) + 'L"%s"' % literal, t, count=1)
+                  if n == 1:
+                      with open(cpp, "w", encoding="utf-8") as f:
+                          f.write(new_t)
+                      print("Successfully patched MSI CustomAction printer port")
+                  else:
+                      print("Warning: RD_PRINTER_PORT not matched in RemotePrinter.cpp")
+
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@v1
+        with:
+          version: ${{ env.LLVM_VERSION }}
+
+      - name: Install flutter
+        uses: subosito/flutter-action@v2.12.0 #https://github.com/subosito/flutter-action/issues/277
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      # https://github.com/flutter/flutter/issues/155685
+      - name: Replace engine with rustdesk custom flutter engine
+        run: |
+          flutter doctor -v
+          flutter precache --windows
+          Invoke-WebRequest -Uri https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip -OutFile windows-x64-release.zip
+          Expand-Archive -Path windows-x64-release.zip -DestinationPath windows-x64-release
+          mv -Force windows-x64-release/*  C:/hostedtoolcache/windows/flutter/stable-${{ env.FLUTTER_VERSION }}-x64/bin/cache/artifacts/engine/windows-x64-release/
+
+      - name: Patch flutter
+        shell: bash
+        run: |
+          cp .github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff $(dirname $(dirname $(which flutter)))
+          cd $(dirname $(dirname $(which flutter)))
+          if [[ "3.24.5" == ${{env.FLUTTER_VERSION}} ]]; then
+            git apply flutter_3.24.4_dropdown_menu_enableFilter.diff
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.SCITER_RUST_VERSION }}
+          targets: ${{ matrix.job.target }}
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ${{ matrix.job.os }}
+
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        env:
+          VCPKG_DEFAULT_HOST_TRIPLET: ${{ matrix.job.vcpkg-triplet }}
+        run: |
+          if ! $VCPKG_ROOT/vcpkg \
+            install \
+            --triplet ${{ matrix.job.vcpkg-triplet }} \
+            --x-install-root="$VCPKG_ROOT/installed"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do
+              echo "$_1:"
+              echo "======"
+              cat "$_1"
+              echo "======"
+              echo ""
+            done
+            exit 1
+          fi
+          head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-${{ matrix.job.vcpkg-triplet }}-rel-out.log" || true
+        shell: bash
+          
+      # KEZAS DESK: ikony z kezas/ (wielorozmiarowa ikona programu, ikona zasobnika 32 px, PNG)
+      - name: KEZAS DESK icons
+        shell: pwsh
+        run: |
+          foreach ($f in 'icon.ico','icon.png','tray-icon.ico','32x32.png','64x64.png','128x128.png','128x128@2x.png') {
+            Copy-Item -Force "./kezas-rdgen/kezas/$f" "./res/$f"
+          }
+          Get-FileHash ./res/icon.ico, ./res/icon.png, ./res/tray-icon.ico | Format-Table -AutoSize
+
+      - name: ui.rs icon
+        continue-on-error: true
+        shell: bash
+        run: |
+          cp ./src/ui.rs ./src/ui.rs.bak
+          b64=$(base64 -w0 < ./res/icon.png)
+          perl -0777 -pe "s|iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHL[A-Za-z0-9+/=]+|$b64|g" -i.bak ./src/ui.rs
+          b64=""
+
+      - name: removeNewVersionNotif
+        continue-on-error: true
+        shell: bash
+        run: | 
+          sed -i -e 's|updateUrl.isNotEmpty|false|' ./flutter/lib/desktop/pages/desktop_home_page.dart
+          sed -i '/let (request, url) =/,/Ok(())/{/Ok(())/!d}' ./src/common.rs
+
+      - name: replace flutter icons
+        continue-on-error: true
+        run: |
+          cd ./flutter
+          #flutter pub upgrade win32
+          flutter pub get
+          flutter pub run flutter_launcher_icons
+          # flutter_launcher_icons writes app_icon.ico with a single 48x48 image, which the taskbar,
+          # the exe and the shortcuts then rescale; use the multi-size icon instead
+          cp ../res/icon.ico ./windows/runner/resources/app_icon.ico
+          cd ..
+
+      - name: Checkout printer-adapter crate
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: ./temp-repo
+
+      - name: Move printer-adapter into place
+        shell: pwsh
+        run: |
+          if (Test-Path "./temp-repo/printer-adapter") {
+            Move-Item -Path "./temp-repo/printer-adapter" -Destination "./printer-adapter" -Force
+            Remove-Item -Recurse -Force "./temp-repo"
+            Write-Host "Successfully placed printer-adapter into workspace."
+          } else {
+            Write-Host "Error: printer-adapter folder not found in repository."
+          }
+
+      - name: Build rustdesk
+        run: |
+          # Windows: build RustDesk
+          python3 .\build.py --portable --flutter --skip-portable-pack --hwcodec ${{ matrix.job.build-args }}
+          mv ./flutter/build/windows/x64/runner/Release ./rustdesk
+ 
+          # Download usbmmidd_v2.zip and extract it to ./rustdesk
+          Invoke-WebRequest -Uri https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip -OutFile usbmmidd_v2.zip
+          Expand-Archive usbmmidd_v2.zip -DestinationPath . -Force
+          Remove-Item -Path usbmmidd_v2\Win32 -Recurse
+          Remove-Item -Path "usbmmidd_v2\deviceinstaller64.exe", "usbmmidd_v2\deviceinstaller.exe", "usbmmidd_v2\usbmmidd.bat"
+          mv -Force .\usbmmidd_v2 ./rustdesk   
+
+          # Download and install driver package
+          try {
+            Invoke-WebRequest -Uri https://github.com/rustdesk/hbb_common/releases/download/driver/rustdesk_printer_driver_v4-1.4.zip -OutFile rustdesk_printer_driver_v4-1.4.zip
+            Expand-Archive rustdesk_printer_driver_v4-1.4.zip -DestinationPath .
+            mkdir ./rustdesk/drivers -ErrorAction SilentlyContinue
+            mv -Force .\rustdesk_printer_driver_v4-1.4 ./rustdesk/drivers/RustDeskPrinterDriver
+          } catch {
+            Write-Host "Warning: Printer driver download failed."
+          }
+
+          # Build and install open printer adapter
+          if (Test-Path "./printer-adapter/Cargo.toml") {
+            Write-Host "Building open printer-adapter..."
+            pushd ./printer-adapter
+            cargo build --release --locked
+            popd
+            if (Test-Path "./printer-adapter/target/release/printer_driver_adapter.dll") {
+              cp -Force "./printer-adapter/target/release/printer_driver_adapter.dll" "./rustdesk/printer_driver_adapter.dll"
+              Write-Host "Replaced printer_driver_adapter.dll with open implementation."
+            } else {
+              Write-Host "Error: printer-adapter build succeeded but DLL was not found."
+            }
+          } else {
+            Write-Host "Warning: ./printer-adapter/Cargo.toml not found, remote printing will remain disabled."
+          }
+
+      # KEZAS DESK: ikona i logo w zasobach Fluttera
+      - name: KEZAS DESK assets (icon, logo)
+        shell: pwsh
+        run: |
+          $a = "./rustdesk/data/flutter_assets/assets"
+          Move-Item -Force "$a/icon.svg" "$a/icon.svg.bak"
+          magick ./kezas-rdgen/kezas/icon_symbol_256.png "$a/icon.svg"
+          Copy-Item -Force ./kezas-rdgen/kezas/icon48.png "$a/icon.png"
+          Copy-Item -Force ./res/icon.ico "$a/icon.ico"
+          foreach ($f in 'logo.png','logo_light.png','logo_dark.png') { Copy-Item -Force "./kezas-rdgen/kezas/$f" "$a/$f" }
+
+      - name: find Runner.res
+        # Windows: find Runner.res (compiled from ./flutter/windows/runner/Runner.rc), copy to ./Runner.res
+        # Runner.rc does not contain actual version, but Runner.res does
+        continue-on-error: true
+        shell: bash
+        run: |
+          runner_res=$(find . -name "Runner.res");
+          if [ "$runner_res" == "" ]; then
+            echo "Runner.res: not found";
+          else
+            echo "Runner.res: $runner_res";
+            cp $runner_res ./libs/portable/Runner.res;
+            echo "list ./libs/portable/Runner.res";
+            ls -l ./libs/portable/Runner.res;
+          fi
+
+      - name: Download RustDeskTempTopMostWindow artifacts
+        uses: actions/download-artifact@v4
+        if: env.UPLOAD_ARTIFACT == 'true'
+        with:
+          name: topmostwindow-artifacts
+          path: "./rustdesk"
+      
+      # KEZAS DESK: wbudowane ustawienia (custom_.txt = base64 z kezas/custom.json, BEZ hasla)
+      - name: Create custom_.txt
+        shell: python
+        run: |
+          import base64, json
+          cfg = json.load(open('./kezas-rdgen/kezas/custom.json', encoding='utf-8'))
+          # zadnych hasel w programie: zabronione klucze z haslem na kazdym poziomie (approve-mode=password to tylko tryb akceptacji)
+          def klucze(d):
+              for k, v in d.items():
+                  yield k
+                  if isinstance(v, dict): yield from klucze(v)
+          zakazane = [k for k in klucze(cfg) if k.lower() in ('password', 'permanent-password', 'permanent_password', 'temporary-password', 'perm-pass', 'pwd')]
+          assert not zakazane, 'haslo w custom.json: ' + str(zakazane)
+          data = base64.b64encode(json.dumps(cfg, separators=(',', ':')).encode('utf-8')).decode('ascii')
+          open('./rustdesk/custom_.txt', 'w', encoding='ascii').write(data)
+          print('custom_.txt:', json.dumps(cfg))
+
+      - name: Build self-extracted executable
+        shell: bash
+        if: env.UPLOAD_ARTIFACT == 'true'
+        run: |
+          mv "./rustdesk/rustdesk.exe" "./rustdesk/${{ env.appname }}.exe" || echo "rustdesk.exe"
+          sed -i '/dpiAware/d' res/manifest.xml
+          pushd ./libs/portable
+          pip3 install -r requirements.txt
+          python3 ./generate.py -f ../../rustdesk/ -o . -e "../../rustdesk/${{ env.appname }}.exe"
+          popd
+          mkdir -p ./SignOutput
+          mv ./target/release/rustdesk-portable-packer.exe "./SignOutput/rustdesk.exe"
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build msi
+        if: env.UPLOAD_ARTIFACT == 'true'
+        run: |
+          $myappname = "${{ env.appname }}" -replace '\s','_'
+          cp "rustdesk/${{ env.appname }}.exe" "rustdesk/${myappname}.exe" -ErrorAction SilentlyContinue
+          pushd ./res/msi
+          python preprocess.py --app-name "$myappname" --arp -d ../../rustdesk
+          nuget restore msi.sln
+          msbuild msi.sln -p:Configuration=Release -p:Platform=x64 /p:TargetVersion=Windows10
+          cp ./Package/bin/x64/Release/en-us/Package.msi ../../SignOutput/rustdesk-latest.msi
+          mv ./Package/bin/x64/Release/en-us/Package.msi ../../SignOutput/rustdesk.msi
+          sha256sum ../../SignOutput/rustdesk.msi
+
+      - name: Rename and checksum
+        shell: pwsh
+        run: |
+          Move-Item ./SignOutput/rustdesk.exe "./SignOutput/${{ env.filename }}-${{ inputs.version }}-x86_64.exe"
+          Move-Item ./SignOutput/rustdesk.msi "./SignOutput/${{ env.filename }}-${{ inputs.version }}-x86_64.msi"
+          Remove-Item ./SignOutput/rustdesk-latest.msi -ErrorAction SilentlyContinue
+          Get-ChildItem ./SignOutput -File | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } | Set-Content ./SignOutput/SHA256SUMS.txt -Encoding ascii
+          Get-Content ./SignOutput/SHA256SUMS.txt
+
+      - name: Upload KEZAS DESK
+        uses: actions/upload-artifact@v4
+        with:
+          name: kezas-desk-windows
+          path: ./SignOutput/*
+          if-no-files-found: error
+          retention-days: 30

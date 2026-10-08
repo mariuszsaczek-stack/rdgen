@@ -1,0 +1,12 @@
+{
+  "app-name": "KEZAS DESK",
+  "default-settings": {
+    "direct-server": "Y",
+    "approve-mode": "password",
+    "verification-method": "use-permanent-password",
+    "view-style": "adaptive",
+    "image-quality": "best",
+    "codec-preference": "h264",
+    "enable-confirm-closing-tabs": "Y"
+  }
+}
