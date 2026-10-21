@@ -330,6 +330,14 @@ jobs:
           sed -i -e 's|updateUrl.isNotEmpty|false|' ./flutter/lib/desktop/pages/desktop_home_page.dart
           sed -i '/let (request, url) =/,/Ok(())/{/Ok(())/!d}' ./src/common.rs
 
+      # KEZAS DESK: updates only from our own build - fail if the vendor update check was not removed
+      - name: Verify update check removed
+        shell: bash
+        run: |
+          if grep -q 'version_check_request' ./src/common.rs; then echo 'update check still present in src/common.rs'; exit 1; fi
+          if grep -q 'updateUrl.isNotEmpty' ./flutter/lib/desktop/pages/desktop_home_page.dart; then echo 'update banner still present'; exit 1; fi
+          echo 'OK: update check removed'
+
       - name: replace flutter icons
         continue-on-error: true
         run: |
